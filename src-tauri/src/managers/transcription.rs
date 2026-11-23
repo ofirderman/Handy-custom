@@ -696,13 +696,21 @@ impl TranscriptionManager {
     /// loading, and returns whether it did. Only a dictation sets
     /// `raise_notice`: file jobs and Settings report their own failures.
     pub fn initiate_model_load(&self, raise_notice: bool) -> bool {
+        self.initiate_model_load_for(get_settings(&self.app_handle).selected_model, raise_notice)
+    }
+
+    /// Load the requested model without changing the persisted selection.
+    pub fn initiate_model_load_for(&self, model_id: String, raise_notice: bool) -> bool {
         let mut is_loading = self.is_loading.lock().unwrap();
         if *is_loading {
             return false;
         }
 
         let reload_pending = self.reload_model_on_next_use.load(Ordering::Acquire);
-        if !reload_pending && self.is_model_loaded() {
+        if !reload_pending
+            && self.is_model_loaded()
+            && self.get_current_model().as_deref() == Some(model_id.as_str())
+        {
             return false;
         }
 
@@ -714,11 +722,10 @@ impl TranscriptionManager {
                     .reload_model_on_next_use
                     .store(false, Ordering::Release);
             }
-            let settings = get_settings(&self_clone.app_handle);
-            if let Err(e) = self_clone.load_model(&settings.selected_model) {
-                error!("Failed to load model {}: {}", settings.selected_model, e);
+            if let Err(e) = self_clone.load_model(&model_id) {
+                error!("Failed to load model {}: {}", model_id, e);
                 if raise_notice {
-                    self_clone.raise_model_load_failed(&settings.selected_model, &e);
+                    self_clone.raise_model_load_failed(&model_id, &e);
                 }
             }
             let mut is_loading = self_clone.is_loading.lock().unwrap();
@@ -978,7 +985,7 @@ impl TranscriptionManager {
     /// Transcribe a whole clip in batch: a re-transcribed history entry, or
     /// a file from the CLI.
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
-        Ok(self.complete(Instant::now(), audio, None)?.text)
+        Ok(self.complete(Instant::now(), audio, None, None, None)?.text)
     }
 
     /// Transcribe a finished recording: what its live decode produced, or a
@@ -986,7 +993,27 @@ impl TranscriptionManager {
     pub fn transcribe_recording(&self, samples: Vec<f32>) -> Result<Transcription> {
         let started = Instant::now();
         let live = self.finalize_live(samples.len())?;
-        self.complete(started, samples, live)
+        self.complete(started, samples, live, None, None)
+    }
+
+    /// Explicit profiles use batch decoding so no live result can come from
+    /// another profile's model or language settings.
+    pub fn transcribe_recording_for_profile(
+        &self,
+        samples: Vec<f32>,
+        model_id: &str,
+        language: Option<&str>,
+    ) -> Result<Transcription> {
+        self.complete(Instant::now(), samples, None, Some(model_id), language)
+    }
+
+    fn settings_for_profile(&self, language: Option<&str>) -> AppSettings {
+        let mut settings = get_settings(&self.app_handle);
+        if let Some(language) = language {
+            settings.selected_language = language.to_owned();
+            settings.translate_to_english = false;
+        }
+        settings
     }
 
     /// The final text of one transcription, from its live result or else a
@@ -996,6 +1023,8 @@ impl TranscriptionManager {
         started: Instant,
         audio: Vec<f32>,
         live: Option<RunOutcome>,
+        expected_model: Option<&str>,
+        language: Option<&str>,
     ) -> Result<Transcription> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
@@ -1017,9 +1046,9 @@ impl TranscriptionManager {
 
         let outcome = match live {
             Some(outcome) => outcome,
-            None => self.decode_batch(audio)?,
+            None => self.decode_batch(audio, expected_model, language)?,
         };
-        let settings = get_settings(&self.app_handle);
+        let settings = self.settings_for_profile(language);
         let language = outcome
             .setup
             .spoken_language(outcome.model_detected_language.as_deref());
@@ -1060,19 +1089,29 @@ impl TranscriptionManager {
 
     /// Decode a whole clip with the loaded model, loading it first if a load
     /// is under way.
-    fn decode_batch(&self, audio: Vec<f32>) -> Result<RunOutcome> {
+    fn decode_batch(
+        &self,
+        audio: Vec<f32>,
+        expected_model: Option<&str>,
+        language: Option<&str>,
+    ) -> Result<RunOutcome> {
         // A cancel from here on (during the model-load wait or chunk planning
         // included) stops every run of this transcription.
         let mark = self.engine.cancel_mark();
         self.touch_activity();
-        let batch = self.batch_context(&audio)?;
+        let batch = self.batch_context(&audio, expected_model, language)?;
         self.transcribe_cpp(mark, batch, audio)
     }
 
     /// Waits out any model load, then reads what a batch transcription of
     /// `audio` runs with: the loaded model, the settings, and the language
     /// resolved for it.
-    fn batch_context(&self, audio: &[f32]) -> Result<BatchContext> {
+    fn batch_context(
+        &self,
+        audio: &[f32],
+        expected_model: Option<&str>,
+        language: Option<&str>,
+    ) -> Result<BatchContext> {
         {
             let mut is_loading = self.is_loading.lock().unwrap();
             while *is_loading {
@@ -1083,7 +1122,13 @@ impl TranscriptionManager {
             return Err(anyhow::anyhow!("Model is not loaded for transcription."));
         };
 
-        let settings = get_settings(&self.app_handle);
+        if let Some(expected) = expected_model {
+            if self.get_current_model().as_deref() != Some(expected) {
+                return Err(anyhow::anyhow!("Requested profile model is not loaded: {}", expected));
+            }
+        }
+
+        let settings = self.settings_for_profile(language);
         // Validate against the model that's actually loaded (which can differ
         // from settings.selected_model when a caller loaded a specific model —
         // e.g. the --transcribe-file path's --model), not the persisted
