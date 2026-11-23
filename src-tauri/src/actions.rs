@@ -136,6 +136,23 @@ struct TranscribeAction {
     post_process: bool,
 }
 
+/// Opt-in development profile. The installed app's settings are never
+/// rewritten, and no profile is enabled unless explicitly configured.
+fn profile_override(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+fn dictation_profile(settings: &AppSettings, post_process: bool) -> (String, Option<String>, bool) {
+    let code_model = profile_override(std::env::var("HANDY_CODE_ASR_MODEL").ok());
+    let code_language = profile_override(std::env::var("HANDY_CODE_ASR_LANGUAGE").ok());
+    let enabled = code_model.is_some() || code_language.is_some();
+    if post_process {
+        (code_model.unwrap_or_else(|| settings.selected_model.clone()), code_language, enabled)
+    } else {
+        (settings.selected_model.clone(), None, enabled)
+    }
+}
+
 /// Field name for structured output JSON schema
 const TRANSCRIPTION_FIELD: &str = "transcription";
 
@@ -525,8 +542,10 @@ impl ShortcutAction for TranscribeAction {
         // Load ASR model and VAD model in parallel
         let kickoff_started = Instant::now();
         // An empty selection has nothing to load; the check below says so.
-        let selected_model = get_settings(app).selected_model;
-        let load_started = !selected_model.is_empty() && tm.initiate_model_load(true);
+        let (selected_model, _, profile_enabled) =
+            dictation_profile(&get_settings(app), self.post_process);
+        let load_started = !selected_model.is_empty()
+            && tm.initiate_model_load_for(selected_model.clone(), true);
         let rm_clone = Arc::clone(&rm);
         std::thread::spawn(move || {
             if let Err(e) = rm_clone.preload_vad() {
@@ -537,7 +556,7 @@ impl ShortcutAction for TranscribeAction {
 
         // Don't open the mic if nothing can transcribe the recording. A load
         // started above reports its own failure; one already running doesn't.
-        if !tm.is_model_loaded() {
+        if profile_enabled || !tm.is_model_loaded() {
             if selected_model.is_empty() {
                 warn!("Not starting recording: no model is selected");
                 tm.raise_no_model_selected();
@@ -568,15 +587,13 @@ impl ShortcutAction for TranscribeAction {
 
         let selected_model_info = app
             .state::<Arc<ModelManager>>()
-            .get_model_info(&settings.selected_model);
+            .get_model_info(&selected_model);
 
         // Use the app-facing model capability as the single pre-recording source
         // for live streaming decisions. Unknown support is represented as false
         // until the model registry is updated by discovery or runtime load.
-        let model_supports_streaming = selected_model_info
-            .as_ref()
-            .map(|m| m.supports_streaming)
-            .unwrap_or(false);
+        let model_supports_streaming = !profile_enabled
+            && selected_model_info.as_ref().is_some_and(|m| m.supports_streaming);
         let vad_policy = if !settings.vad_enabled {
             VadPolicy::Disabled
         } else if model_supports_streaming {
@@ -591,7 +608,9 @@ impl ShortcutAction for TranscribeAction {
             streaming: model_supports_streaming,
             long_form: false,
         };
-        if live_decode(expected_model, settings.long_form_chunking) != LiveDecode::None {
+        if !profile_enabled
+            && live_decode(expected_model, settings.long_form_chunking) != LiveDecode::None
+        {
             tm.start_stream();
         }
         let plan_elapsed = plan_started.elapsed();
@@ -737,6 +756,8 @@ impl ShortcutAction for TranscribeAction {
 
         let binding_id = binding_id.to_string(); // Clone binding_id for the async task
         let post_process = self.post_process;
+        let (profile_model, profile_language, profile_enabled) =
+            dictation_profile(&get_settings(app), post_process);
         let cancel_generation = rm.cancel_generation();
 
         tauri::async_runtime::spawn(async move {
@@ -787,7 +808,15 @@ impl ShortcutAction for TranscribeAction {
                     // otherwise a batch run of the samples. A cancel is surfaced
                     // as an error, so it never starts a batch run.
                     let transcription_time = Instant::now();
-                    let transcription_result = tm.transcribe_recording(samples);
+                    let transcription_result = if profile_enabled {
+                        tm.transcribe_recording_for_profile(
+                            samples,
+                            &profile_model,
+                            profile_language.as_deref(),
+                        )
+                    } else {
+                        tm.transcribe_recording(samples)
+                    };
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {
@@ -1127,6 +1156,13 @@ mod tests {
     use std::time::Duration;
 
     /// Settings that run unstructured post-processing against `base_url`.
+    #[test]
+    fn blank_profile_overrides_are_ignored() {
+        assert_eq!(super::profile_override(None), None);
+        assert_eq!(super::profile_override(Some("  ".into())), None);
+        assert_eq!(super::profile_override(Some(" en ".into())), Some("en".into()));
+    }
+
     fn post_process_settings(base_url: &str) -> AppSettings {
         let mut settings = get_default_settings();
         let provider = settings
