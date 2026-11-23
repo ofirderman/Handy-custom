@@ -1,0 +1,10 @@
+{
+  "productName": "Handy Custom",
+  "identifier": "com.pais.handy.custom",
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "signCommand": null
+    }
+  }
+}
