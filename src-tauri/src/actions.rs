@@ -147,7 +147,11 @@ fn dictation_profile(settings: &AppSettings, post_process: bool) -> (String, Opt
     let code_language = profile_override(std::env::var("HANDY_CODE_ASR_LANGUAGE").ok());
     let enabled = code_model.is_some() || code_language.is_some();
     if post_process {
-        (code_model.unwrap_or_else(|| settings.selected_model.clone()), code_language, enabled)
+        (
+            code_model.unwrap_or_else(|| settings.selected_model.clone()),
+            code_language,
+            enabled,
+        )
     } else {
         (settings.selected_model.clone(), None, enabled)
     }
@@ -544,8 +548,8 @@ impl ShortcutAction for TranscribeAction {
         // An empty selection has nothing to load; the check below says so.
         let (selected_model, _, profile_enabled) =
             dictation_profile(&get_settings(app), self.post_process);
-        let load_started = !selected_model.is_empty()
-            && tm.initiate_model_load_for(selected_model.clone(), true);
+        let load_started =
+            !selected_model.is_empty() && tm.initiate_model_load_for(selected_model.clone(), true);
         let rm_clone = Arc::clone(&rm);
         std::thread::spawn(move || {
             if let Err(e) = rm_clone.preload_vad() {
@@ -593,7 +597,9 @@ impl ShortcutAction for TranscribeAction {
         // for live streaming decisions. Unknown support is represented as false
         // until the model registry is updated by discovery or runtime load.
         let model_supports_streaming = !profile_enabled
-            && selected_model_info.as_ref().is_some_and(|m| m.supports_streaming);
+            && selected_model_info
+                .as_ref()
+                .is_some_and(|m| m.supports_streaming);
         let vad_policy = if !settings.vad_enabled {
             VadPolicy::Disabled
         } else if model_supports_streaming {
@@ -1160,7 +1166,14 @@ mod tests {
     fn blank_profile_overrides_are_ignored() {
         assert_eq!(super::profile_override(None), None);
         assert_eq!(super::profile_override(Some("  ".into())), None);
-        assert_eq!(super::profile_override(Some(" en ".into())), Some("en".into()));
+        assert_eq!(
+            super::profile_override(Some(" en ".into())),
+            Some("en".into())
+        );
+        assert_eq!(
+            super::profile_override(Some(" he ".into())),
+            Some("he".into())
+        );
     }
 
     fn post_process_settings(base_url: &str) -> AppSettings {
